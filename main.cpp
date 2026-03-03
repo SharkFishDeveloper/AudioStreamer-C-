@@ -5,7 +5,7 @@
 
 using namespace std;
 
-#define SAMPLE_RATE 48000
+#define SAMPLE_RATE 44100
 #define FRAMES_PER_BUFFER 512
 
 vector<float> recordedSamples;
@@ -22,7 +22,6 @@ static int audioCallback(
 
     const float* in = (const float*)inputBuffer;
 
-    // 2 channels (stereo)
     for (unsigned int i = 0; i < framesPerBuffer * 2; i++) {
         recordedSamples.push_back(in[i]);
     }
@@ -38,32 +37,34 @@ int main() {
     }
 
     int numDevices = Pa_GetDeviceCount();
-    int loopbackDevice = -1;
+    int jibLoopbackDevice = -1;
 
-    // Find Realtek Loopback device automatically
+    // Find JIB TRUE 2 Loopback
     for (int i = 0; i < numDevices; i++) {
         const PaDeviceInfo* info = Pa_GetDeviceInfo(i);
 
-        if (string(info->name).find("[Loopback]") != string::npos &&
-            string(info->name).find("Realtek") != string::npos) {
-            loopbackDevice = i;
+        string name = info->name;
+
+        if (name.find("JIB TRUE 2") != string::npos &&
+            name.find("[Loopback]") != string::npos) {
+            jibLoopbackDevice = i;
             break;
         }
     }
 
-    if (loopbackDevice == -1) {
-        cout << "Realtek Loopback device not found.\n";
+    if (jibLoopbackDevice == -1) {
+        cout << "JIB Loopback device not found.\n";
         return 1;
     }
 
-    cout << "Using device ID: " << loopbackDevice << endl;
+    cout << "Using device ID: " << jibLoopbackDevice << endl;
 
     PaStreamParameters params;
-    params.device = loopbackDevice;
+    params.device = jibLoopbackDevice;
     params.channelCount = 2;
     params.sampleFormat = paFloat32;
     params.suggestedLatency =
-        Pa_GetDeviceInfo(loopbackDevice)->defaultLowInputLatency;
+        Pa_GetDeviceInfo(jibLoopbackDevice)->defaultLowInputLatency;
     params.hostApiSpecificStreamInfo = NULL;
 
     PaStream* stream;
@@ -85,7 +86,7 @@ int main() {
 
     Pa_StartStream(stream);
 
-    cout << ">>> PLAY AUDIO NOW. Press Enter to stop recording.\n";
+    cout << ">>> PLAY AUDIO THROUGH JIB. Press Enter to stop.\n";
     cin.get();
 
     Pa_StopStream(stream);
@@ -94,11 +95,11 @@ int main() {
     cout << "Captured samples: " << recordedSamples.size() << endl;
 
     if (!recordedSamples.empty()) {
-        ofstream file("realtek_loopback.raw", ios::binary);
+        ofstream file("jib_loopback.raw", ios::binary);
         file.write((char*)recordedSamples.data(),
                    recordedSamples.size() * sizeof(float));
         file.close();
-        cout << "Saved realtek_loopback.raw\n";
+        cout << "Saved jib_loopback.raw\n";
     } else {
         cout << "No audio captured.\n";
     }
