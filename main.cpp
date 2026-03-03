@@ -5,12 +5,12 @@
 
 using namespace std;
 
-#define SAMPLE_RATE 44100
+#define SAMPLE_RATE 16000
 #define FRAMES_PER_BUFFER 512
 
 vector<float> recordedSamples;
 
-static int audioCallback(
+static int micCallback(
     const void *inputBuffer,
     void *,
     unsigned long framesPerBuffer,
@@ -22,7 +22,8 @@ static int audioCallback(
 
     const float* in = (const float*)inputBuffer;
 
-    for (unsigned int i = 0; i < framesPerBuffer * 2; i++) {
+    // Mono mic
+    for (unsigned int i = 0; i < framesPerBuffer; i++) {
         recordedSamples.push_back(in[i]);
     }
 
@@ -37,34 +38,32 @@ int main() {
     }
 
     int numDevices = Pa_GetDeviceCount();
-    int jibLoopbackDevice = -1;
+    int jibMicDevice = -1;
 
-    // Find JIB TRUE 2 Loopback
+    // Find JIB mic (NOT loopback)
     for (int i = 0; i < numDevices; i++) {
         const PaDeviceInfo* info = Pa_GetDeviceInfo(i);
-
         string name = info->name;
 
-        if (name.find("JIB TRUE 2") != string::npos &&
-            name.find("[Loopback]") != string::npos) {
-            jibLoopbackDevice = i;
+        if (name.find("Headset (JIB TRUE 2)") != string::npos) {
+            jibMicDevice = i;
             break;
         }
     }
 
-    if (jibLoopbackDevice == -1) {
-        cout << "JIB Loopback device not found.\n";
+    if (jibMicDevice == -1) {
+        cout << "JIB mic not found.\n";
         return 1;
     }
 
-    cout << "Using device ID: " << jibLoopbackDevice << endl;
+    cout << "Using JIB mic ID: " << jibMicDevice << endl;
 
     PaStreamParameters params;
-    params.device = jibLoopbackDevice;
-    params.channelCount = 2;
+    params.device = jibMicDevice;
+    params.channelCount = 1;   // mono
     params.sampleFormat = paFloat32;
     params.suggestedLatency =
-        Pa_GetDeviceInfo(jibLoopbackDevice)->defaultLowInputLatency;
+        Pa_GetDeviceInfo(jibMicDevice)->defaultLowInputLatency;
     params.hostApiSpecificStreamInfo = NULL;
 
     PaStream* stream;
@@ -76,7 +75,7 @@ int main() {
         SAMPLE_RATE,
         FRAMES_PER_BUFFER,
         paClipOff,
-        audioCallback,
+        micCallback,
         NULL);
 
     if (err != paNoError) {
@@ -86,7 +85,7 @@ int main() {
 
     Pa_StartStream(stream);
 
-    cout << ">>> PLAY AUDIO THROUGH JIB. Press Enter to stop.\n";
+    cout << ">>> Speak into JIB mic. Press Enter to stop.\n";
     cin.get();
 
     Pa_StopStream(stream);
@@ -95,11 +94,11 @@ int main() {
     cout << "Captured samples: " << recordedSamples.size() << endl;
 
     if (!recordedSamples.empty()) {
-        ofstream file("jib_loopback.raw", ios::binary);
+        ofstream file("jib_mic.raw", ios::binary);
         file.write((char*)recordedSamples.data(),
                    recordedSamples.size() * sizeof(float));
         file.close();
-        cout << "Saved jib_loopback.raw\n";
+        cout << "Saved jib_mic.raw\n";
     } else {
         cout << "No audio captured.\n";
     }
