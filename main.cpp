@@ -5,104 +5,113 @@
 
 using namespace std;
 
-#define SAMPLE_RATE 16000
 #define FRAMES_PER_BUFFER 512
+
+int g_numChannels = 2;
+double g_sampleRate = 44100;
 
 vector<float> recordedSamples;
 
-static int micCallback(
-    const void *inputBuffer,
-    void *,
+static int audioCallback(
+    const void* inputBuffer,
+    void*,
     unsigned long framesPerBuffer,
     const PaStreamCallbackTimeInfo*,
     PaStreamCallbackFlags,
-    void *)
+    void*)
 {
     if (!inputBuffer) return paContinue;
 
     const float* in = (const float*)inputBuffer;
 
-    // Mono mic
-    for (unsigned int i = 0; i < framesPerBuffer; i++) {
+    for (unsigned int i = 0; i < framesPerBuffer * g_numChannels; i++)
         recordedSamples.push_back(in[i]);
-    }
 
     return paContinue;
 }
 
-int main() {
-    PaError err = Pa_Initialize();
-    if (err != paNoError) {
-        cout << "PortAudio init error\n";
-        return 1;
-    }
+int main()
+{
+    Pa_Initialize();
 
     int numDevices = Pa_GetDeviceCount();
-    int jibMicDevice = -1;
 
-    // Find JIB mic (NOT loopback)
-    for (int i = 0; i < numDevices; i++) {
-        const PaDeviceInfo* info = Pa_GetDeviceInfo(i);
-        string name = info->name;
+    cout << "Available audio devices:\n\n";
 
-        if (name.find("Headset (JIB TRUE 2)") != string::npos) {
-            jibMicDevice = i;
-            break;
-        }
+    for (int i = 0; i < numDevices; i++)
+    {
+        const PaDeviceInfo* dev = Pa_GetDeviceInfo(i);
+        const PaHostApiInfo* host = Pa_GetHostApiInfo(dev->hostApi);
+
+        cout << "ID: " << i << endl;
+        cout << "Name: " << dev->name << endl;
+        cout << "Host API: " << host->name << endl;
+        cout << "Max Input Channels: " << dev->maxInputChannels << endl;
+        cout << "Max Output Channels: " << dev->maxOutputChannels << endl;
+        cout << "Default Sample Rate: " << dev->defaultSampleRate << endl;
+        cout << "---------------------------\n";
     }
 
-    if (jibMicDevice == -1) {
-        cout << "JIB mic not found.\n";
-        return 1;
-    }
+    int selectedDevice;
 
-    cout << "Using JIB mic ID: " << jibMicDevice << endl;
+    cout << "\nEnter device ID to capture: ";
+    cin >> selectedDevice;
+    cin.ignore();
+
+    const PaDeviceInfo* dev = Pa_GetDeviceInfo(selectedDevice);
+
+
+    g_numChannels = dev->maxInputChannels;
+    g_sampleRate = dev->defaultSampleRate;
+
+    cout << "\nUsing device settings:\n";
+    cout << "Channels: " << g_numChannels << endl;
+    cout << "Sample Rate: " << g_sampleRate << endl;
 
     PaStreamParameters params;
-    params.device = jibMicDevice;
-    params.channelCount = 1;   // mono
+    params.device = selectedDevice;
+    params.channelCount = g_numChannels;
     params.sampleFormat = paFloat32;
-    params.suggestedLatency =
-        Pa_GetDeviceInfo(jibMicDevice)->defaultLowInputLatency;
+    params.suggestedLatency = dev->defaultLowInputLatency;
     params.hostApiSpecificStreamInfo = NULL;
 
     PaStream* stream;
 
-    err = Pa_OpenStream(
+    PaError err = Pa_OpenStream(
         &stream,
         &params,
         NULL,
-        SAMPLE_RATE,
+        g_sampleRate,
         FRAMES_PER_BUFFER,
         paClipOff,
-        micCallback,
-        NULL);
+        audioCallback,
+        NULL
+    );
 
-    if (err != paNoError) {
-        cout << "Open error: " << Pa_GetErrorText(err) << endl;
+    if (err != paNoError)
+    {
+        cout << "Stream error: " << Pa_GetErrorText(err) << endl;
+        Pa_Terminate();
         return 1;
     }
 
+    cout << "\nCapturing audio from: " << dev->name << endl;
+    cout << "Press ENTER to stop\n";
+
+    recordedSamples.reserve(g_sampleRate * 60 * g_numChannels);
+
     Pa_StartStream(stream);
 
-    cout << ">>> Speak into JIB mic. Press Enter to stop.\n";
     cin.get();
 
     Pa_StopStream(stream);
     Pa_CloseStream(stream);
 
-    cout << "Captured samples: " << recordedSamples.size() << endl;
+    ofstream file("mic.raw", ios::binary);
+    file.write((char*)recordedSamples.data(),recordedSamples.size() * sizeof(float));
+    file.close();
 
-    if (!recordedSamples.empty()) {
-        ofstream file("jib_mic.raw", ios::binary);
-        file.write((char*)recordedSamples.data(),
-                   recordedSamples.size() * sizeof(float));
-        file.close();
-        cout << "Saved jib_mic.raw\n";
-    } else {
-        cout << "No audio captured.\n";
-    }
+    cout << "Saved to mic.raw\n";
 
     Pa_Terminate();
-    return 0;
 }

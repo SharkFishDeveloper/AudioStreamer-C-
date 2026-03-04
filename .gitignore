@@ -2,3 +2,5 @@ build
 portaudio
 main.exe
 output.wav
+test
+libsamplerate
