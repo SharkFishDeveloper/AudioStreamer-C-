@@ -80,6 +80,10 @@ int    micChannels, spkChannels;
 double micRate,     spkRate;
 steady_clock::time_point recordStart;
 
+// ─── Gain Constants ──────────────────────────────────────────────────────────
+const float MIC_BOOST = 2.5f;     // Increase this (e.g., 3.0f, 4.0f) to hear yourself more
+const float SPK_ATTENUATION = 0.2f;
+
 // ─── Callbacks (lock-free) ────────────────────────────────────────────────────
 static int micCallback(const void* in, void*, unsigned long n,
                        const PaStreamCallbackTimeInfo*, PaStreamCallbackFlags, void*)
@@ -247,12 +251,17 @@ void processingThread()
         size_t frames = max(micMono.size(), spkMono.size());
         vector<float> mixed(frames);
         for (size_t i = 0; i < frames; i++) {
-            float m = (i < micMono.size()) ? micMono[i] : 0.0f;
-            float s = (i < spkMono.size()) ? spkMono[i] : 0.0f;
+            // Apply boost to mic and optional reduction to speakers
+            float m = (i < micMono.size()) ? (micMono[i] * MIC_BOOST) : 0.0f;
+            float s = (i < spkMono.size()) ? (spkMono[i] * SPK_ATTENUATION) : 0.0f;
+            
             bool hasMic = (i < micMono.size());
             bool hasSpk = (i < spkMono.size());
-            // Average when both active; full level in the tail of the longer stream
-            mixed[i] = max(-1.0f, min(1.0f, (hasMic && hasSpk) ? (m+s)*0.5f : m+s));
+            
+            // Use a "Summing" mix instead of a "Dividing" mix to keep mic volume high
+            // We clip to 1.0f anyway to prevent distortion
+            float combined = m + s;
+            mixed[i] = max(-1.0f, min(1.0f, combined));
         }
 
         // FIX 4: push whole vector — pop_front on deque<vector> is O(1)
