@@ -2,8 +2,8 @@ CC = gcc
 CXX = g++
 
 # Compiler settings
+# Added portaudio/src/common to include path so pa_ringbuffer.h is found
 CFLAGS = -I./portaudio/include -I./portaudio/src/common -I./portaudio/src/os/win -DPA_USE_WASAPI=1 $(SAMPLERATE_INC)
-# LDFLAGS = -lwinmm -lole32 -luuid -lsetupapi $(SAMPLERATE_LIB)
 LDFLAGS = -static -static-libgcc -static-libstdc++ -lwinmm -lole32 -luuid -lsetupapi -lavrt
 
 # Folders
@@ -43,10 +43,12 @@ main.exe: $(PA_OBJECTS) $(MAIN_OBJECT)
 	$(CXX) $^ $(LDFLAGS) -o $@
 
 # Compile main.cpp
+# Ensure main can also see the common directory for pa_ringbuffer.h
 $(MAIN_OBJECT): main.cpp
-	$(CXX) -c $< -I./portaudio/include $(SAMPLERATE_INC) -o $@
+	$(CXX) -c $< -I./portaudio/include -I./portaudio/src/common $(SAMPLERATE_INC) -o $@
 
 # Compile PortAudio C files
+# Using VPATH or explicit rules to handle files with the same name in different folders
 $(OBJ_DIR)/%.o: portaudio/src/common/%.c
 	$(CC) -c $< $(CFLAGS) -o $@
 
