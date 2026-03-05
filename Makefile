@@ -1,8 +1,13 @@
-# Compiler settings
 CC = gcc
 CXX = g++
-CFLAGS = -I./portaudio/include -I./portaudio/src/common -I./portaudio/src/os/win -DPA_USE_WASAPI=1
-LDFLAGS = -lwinmm -lole32 -luuid -lsetupapi
+
+# Paths to libsamplerate
+SAMPLERATE_INC = -I./libsamplerate/include
+SAMPLERATE_LIB = -L./libsamplerate/build/src -lsamplerate
+
+# Compiler settings
+CFLAGS = -I./portaudio/include -I./portaudio/src/common -I./portaudio/src/os/win -DPA_USE_WASAPI=1 $(SAMPLERATE_INC)
+LDFLAGS = -lwinmm -lole32 -luuid -lsetupapi $(SAMPLERATE_LIB)
 
 # Folders
 OBJ_DIR = build
@@ -25,7 +30,7 @@ PA_SOURCES = portaudio/src/common/pa_front.c \
              portaudio/src/os/win/pa_win_version.c \
              portaudio/src/hostapi/wasapi/pa_win_wasapi.c
 
-# Convert source file paths to object file paths in the build directory
+# Convert source file paths to object file paths
 PA_OBJECTS = $(addprefix $(OBJ_DIR)/, $(notdir $(PA_SOURCES:.c=.o)))
 MAIN_OBJECT = $(OBJ_DIR)/main.o
 
@@ -40,11 +45,11 @@ $(OBJ_DIR):
 main.exe: $(PA_OBJECTS) $(MAIN_OBJECT)
 	$(CXX) $^ $(LDFLAGS) -o $@
 
-# Compile main.cpp (using C++ compiler)
+# Compile main.cpp
 $(MAIN_OBJECT): main.cpp
-	$(CXX) -c $< -I./portaudio/include -o $@
+	$(CXX) -c $< -I./portaudio/include $(SAMPLERATE_INC) -o $@
 
-# Compile PortAudio C files (using C compiler to avoid WASAPI errors)
+# Compile PortAudio C files
 $(OBJ_DIR)/%.o: portaudio/src/common/%.c
 	$(CC) -c $< $(CFLAGS) -o $@
 
