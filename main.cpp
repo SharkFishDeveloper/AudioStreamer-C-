@@ -6,6 +6,7 @@
 #include <cmath>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
 #include <thread>
 #include <chrono>
 #include <portaudio.h>
@@ -20,27 +21,29 @@ using namespace chrono;
 // ─── Config ───────────────────────────────────────────────────────────────────
 #define FRAMES_PER_BUFFER   512
 #define TARGET_RATE         48000
-#define TARGET_CHANNELS     2
-#define CHUNK_INTERVAL_SEC  10      // flush to disk every 10 s  (~3.7 MB/chunk)
-#define DRIFT_LOG_INTERVAL  30      // print drift report every 30 s
-#define MAX_DRIFT_PPM       500.0   // warn if drift exceeds 500 ppm (~2s/hour)
+#define TARGET_CHANNELS     1       // mono output
+#define CHUNK_INTERVAL_MS   300
+#define DRIFT_LOG_INTERVAL  30
+#define MAX_DRIFT_PPM       500.0
 
 #ifndef paWASAPIUseOutputDeviceForInput
     #define paWASAPIUseOutputDeviceForInput (1 << 4)
 #endif
 
-// ─── Shared state ─────────────────────────────────────────────────────────────
+// ─── Shared audio buffer ──────────────────────────────────────────────────────
 struct SharedAudio {
-    mutex           mtx;
-    vector<float>   samples;      // drained by the processing thread
+    mutex         mtx;
+    vector<float> samples;
 };
 
 SharedAudio micAudio, spkAudio;
 
-// Drift tracking: count raw frames received by each callback
-atomic<uint64_t>  micTotalFrames{0};
-atomic<uint64_t>  spkTotalFrames{0};
-atomic<bool>      recording{true};
+// ─── Global state ─────────────────────────────────────────────────────────────
+atomic<uint64_t>   micTotalFrames{0};
+atomic<uint64_t>   spkTotalFrames{0};
+atomic<bool>       recording{true};
+mutex              wakeMtx;
+condition_variable wakeCV;
 
 int    micChannels, spkChannels;
 double micRate,     spkRate;
@@ -53,10 +56,8 @@ static int micCallback(const void* in, void*, unsigned long n,
     if (!in) return paContinue;
     const float* src = (const float*)in;
     micTotalFrames.fetch_add(n, memory_order_relaxed);
-    {
-        lock_guard<mutex> lk(micAudio.mtx);
-        micAudio.samples.insert(micAudio.samples.end(), src, src + n * micChannels);
-    }
+    lock_guard<mutex> lk(micAudio.mtx);
+    micAudio.samples.insert(micAudio.samples.end(), src, src + n * micChannels);
     return paContinue;
 }
 
@@ -66,231 +67,215 @@ static int spkCallback(const void* in, void*, unsigned long n,
     if (!in) return paContinue;
     const float* src = (const float*)in;
     spkTotalFrames.fetch_add(n, memory_order_relaxed);
-    {
-        lock_guard<mutex> lk(spkAudio.mtx);
-        spkAudio.samples.insert(spkAudio.samples.end(), src, src + n * spkChannels);
-    }
+    lock_guard<mutex> lk(spkAudio.mtx);
+    spkAudio.samples.insert(spkAudio.samples.end(), src, src + n * spkChannels);
     return paContinue;
 }
 
-// ─── Drift detection ──────────────────────────────────────────────────────────
+// ─── Drift tracking ───────────────────────────────────────────────────────────
 struct DriftState {
-    // Running effective rates, updated each chunk.
-    // Start with nominal values; converge toward measured values.
-    double effectiveMicRate = 0;
-    double effectiveSpkRate = 0;
-    uint64_t prevMicFrames  = 0;
-    uint64_t prevSpkFrames  = 0;
+    double   effectiveMicRate = 0;
+    double   effectiveSpkRate = 0;
+    uint64_t prevMicFrames    = 0;
+    uint64_t prevSpkFrames    = 0;
     steady_clock::time_point lastUpdate;
-    bool initialised = false;
-    uint64_t lastDriftLogAt = 0;   // wall seconds of last drift log
+    bool     initialised      = false;
+    uint64_t lastDriftLogAt   = 0;
 };
 
-// Returns drift-corrected effective rates via out params.
-// Call this before resampling each chunk.
 void updateDrift(DriftState& ds,
-                 double nominalMicRate, double nominalSpkRate,
-                 double& outMicRate,   double& outSpkRate)
+                 double nomMic, double nomSpk,
+                 double& outMic, double& outSpk)
 {
     auto now = steady_clock::now();
 
     if (!ds.initialised) {
-        ds.effectiveMicRate = nominalMicRate;
-        ds.effectiveSpkRate = nominalSpkRate;
+        ds.effectiveMicRate = nomMic;
+        ds.effectiveSpkRate = nomSpk;
         ds.prevMicFrames    = micTotalFrames.load();
         ds.prevSpkFrames    = spkTotalFrames.load();
         ds.lastUpdate       = now;
         ds.initialised      = true;
-        outMicRate = nominalMicRate;
-        outSpkRate = nominalSpkRate;
+        outMic = nomMic; outSpk = nomSpk;
         return;
     }
 
     double elapsed = duration<double>(now - ds.lastUpdate).count();
-    if (elapsed < 1.0) {            // need at least 1 s to get a stable estimate
-        outMicRate = ds.effectiveMicRate;
-        outSpkRate = ds.effectiveSpkRate;
-        return;
-    }
+    if (elapsed < 1.0) { outMic = ds.effectiveMicRate; outSpk = ds.effectiveSpkRate; return; }
 
     uint64_t curMic = micTotalFrames.load(memory_order_relaxed);
     uint64_t curSpk = spkTotalFrames.load(memory_order_relaxed);
+    double mMic = (curMic - ds.prevMicFrames) / elapsed;
+    double mSpk = (curSpk - ds.prevSpkFrames) / elapsed;
 
-    uint64_t deltaMic = curMic - ds.prevMicFrames;
-    uint64_t deltaSpk = curSpk - ds.prevSpkFrames;
+    auto plausible = [](double m, double n) { double r = m/n; return r > 0.9 && r < 1.1; };
+    if (plausible(mMic, nomMic)) ds.effectiveMicRate = 0.8*ds.effectiveMicRate + 0.2*mMic;
+    if (plausible(mSpk, nomSpk)) ds.effectiveSpkRate = 0.8*ds.effectiveSpkRate + 0.2*mSpk;
 
-    double measuredMicRate = deltaMic / elapsed;
-    double measuredSpkRate = deltaSpk / elapsed;
-
-    // Sanity-gate: ignore wild outliers (scheduler hiccups)
-    auto plausible = [](double measured, double nominal) {
-        double ratio = measured / nominal;
-        return ratio > 0.9 && ratio < 1.1;   // within 10 % of nominal
-    };
-
-    // Low-pass blend: 80 % old estimate, 20 % new measurement
-    // → converges in ~5 chunks while rejecting transients
-    if (plausible(measuredMicRate, nominalMicRate))
-        ds.effectiveMicRate = 0.8 * ds.effectiveMicRate + 0.2 * measuredMicRate;
-    if (plausible(measuredSpkRate, nominalSpkRate))
-        ds.effectiveSpkRate = 0.8 * ds.effectiveSpkRate + 0.2 * measuredSpkRate;
-
-    // Drift report
     uint64_t wallSec = (uint64_t)duration<double>(now - recordStart).count();
     if (wallSec - ds.lastDriftLogAt >= (uint64_t)DRIFT_LOG_INTERVAL) {
         ds.lastDriftLogAt = wallSec;
-        double micPpm = 1e6 * (ds.effectiveMicRate - nominalMicRate) / nominalMicRate;
-        double spkPpm = 1e6 * (ds.effectiveSpkRate - nominalSpkRate) / nominalSpkRate;
-        double relPpm = micPpm - spkPpm;   // relative drift between the two clocks
+        double micPpm = 1e6*(ds.effectiveMicRate - nomMic)/nomMic;
+        double spkPpm = 1e6*(ds.effectiveSpkRate - nomSpk)/nomSpk;
+        double relPpm = micPpm - spkPpm;
         cout << "[Drift @ " << wallSec << "s]"
-             << "  mic=" << fixed << (int)micPpm << " ppm"
+             << "  mic=" << (int)micPpm << " ppm"
              << "  spk=" << (int)spkPpm << " ppm"
              << "  relative=" << (int)relPpm << " ppm";
-        if (fabs(relPpm) > MAX_DRIFT_PPM)
-            cout << "  *** HIGH DRIFT — correction active ***";
+        if (fabs(relPpm) > MAX_DRIFT_PPM) cout << "  *** HIGH — correction active ***";
         cout << "\n";
     }
 
     ds.prevMicFrames = curMic;
     ds.prevSpkFrames = curSpk;
     ds.lastUpdate    = now;
-
-    outMicRate = ds.effectiveMicRate;
-    outSpkRate = ds.effectiveSpkRate;
+    outMic = ds.effectiveMicRate;
+    outSpk = ds.effectiveSpkRate;
 }
 
-// ─── Resampler ────────────────────────────────────────────────────────────────
-// Drain `src`, resample from (inChannels, inRate) → (TARGET_CHANNELS, TARGET_RATE).
-// Returns resampled frames; leaves src empty.
-vector<float> drainAndResample(SharedAudio& src, int inChannels, double inRate)
-{
-    vector<float> input;
-    {
-        lock_guard<mutex> lk(src.mtx);
-        input.swap(src.samples);          // zero-copy drain
-    }
-    if (input.empty()) return {};
-
-    ma_data_converter_config cfg = ma_data_converter_config_init(
-        ma_format_f32, ma_format_f32,
-        (ma_uint32)inChannels,  TARGET_CHANNELS,
-        (ma_uint32)round(inRate), TARGET_RATE
-    );
-    cfg.resampling.algorithm       = ma_resample_algorithm_linear;
-    cfg.resampling.linear.lpfOrder = 8;
-
+// ─── Persistent resampler → mono out ─────────────────────────────────────────
+struct Resampler {
     ma_data_converter conv;
-    if (ma_data_converter_init(&cfg, NULL, &conv) != MA_SUCCESS) {
-        cerr << "Resample init failed\n"; exit(1);
+    bool     initialised = false;
+    int      inChannels  = 0;
+    uint32_t currentRate = 0;
+
+    void init(int inCh, uint32_t inRate) {
+        if (initialised) ma_data_converter_uninit(&conv, NULL);
+        ma_data_converter_config cfg = ma_data_converter_config_init(
+            ma_format_f32, ma_format_f32,
+            (ma_uint32)inCh, 1,          // always resample to mono
+            inRate, TARGET_RATE
+        );
+        cfg.resampling.algorithm       = ma_resample_algorithm_linear;
+        cfg.resampling.linear.lpfOrder = 8;
+        if (ma_data_converter_init(&cfg, NULL, &conv) != MA_SUCCESS) {
+            cerr << "Resampler init failed\n"; exit(1);
+        }
+        inChannels  = inCh;
+        currentRate = inRate;
+        initialised = true;
     }
 
-    ma_uint64 framesIn  = input.size() / inChannels;
-    ma_uint64 framesOut = 0;
-    ma_data_converter_get_expected_output_frame_count(&conv, framesIn, &framesOut);
+    ~Resampler() { if (initialised) ma_data_converter_uninit(&conv, NULL); }
 
-    vector<float> out(framesOut * TARGET_CHANNELS);
-    ma_uint64 actualIn  = framesIn;
-    ma_uint64 actualOut = framesOut;
-    ma_data_converter_process_pcm_frames(&conv, input.data(), &actualIn, out.data(), &actualOut);
-    ma_data_converter_uninit(&conv, NULL);
+    vector<float> drain(SharedAudio& src, double inRate) {
+        uint32_t rateInt = (uint32_t)round(inRate);
+        if (!initialised || rateInt != currentRate) init(inChannels, rateInt);
 
-    out.resize(actualOut * TARGET_CHANNELS);
-    return out;
-}
+        vector<float> input;
+        {
+            lock_guard<mutex> lk(src.mtx);
+            input.swap(src.samples);
+        }
+        if (input.empty()) return {};
 
-// ─── WAV helpers ──────────────────────────────────────────────────────────────
-void writeWavHeader(ofstream& f, uint32_t totalSamples)
+        ma_uint64 framesIn  = input.size() / inChannels;
+        ma_uint64 framesOut = 0;
+        ma_data_converter_get_expected_output_frame_count(&conv, framesIn, &framesOut);
+
+        vector<float> out(framesOut + 64);
+        ma_uint64 actualIn  = framesIn;
+        ma_uint64 actualOut = framesOut + 64;
+        ma_data_converter_process_pcm_frames(&conv, input.data(), &actualIn, out.data(), &actualOut);
+        out.resize(actualOut);
+        return out;
+    }
+};
+
+// ─── WAV helpers (mono float32) ───────────────────────────────────────────────
+void writeWavHeader(ofstream& f, uint32_t totalFrames)
 {
-    // totalSamples = number of float32 samples (frames * channels)
-    uint32_t byteRate   = TARGET_RATE * TARGET_CHANNELS * sizeof(float);
-    uint32_t dataBytes  = totalSamples * sizeof(float);
-    uint32_t chunkSize  = 36 + dataBytes;
-
+    uint32_t dataBytes = totalFrames * sizeof(float);   // mono: 1 sample per frame
+    uint32_t byteRate  = TARGET_RATE * sizeof(float);
     auto w16 = [&](uint16_t v){ f.write((char*)&v, 2); };
     auto w32 = [&](uint32_t v){ f.write((char*)&v, 4); };
-
-    f.write("RIFF", 4);  w32(chunkSize);
+    f.write("RIFF", 4); w32(36 + dataBytes);
     f.write("WAVE", 4);
-    f.write("fmt ", 4);  w32(16);
-    w16(3);                          // IEEE float
-    w16(TARGET_CHANNELS);
+    f.write("fmt ", 4); w32(16);
+    w16(3);              // IEEE float PCM
+    w16(1);              // mono
     w32(TARGET_RATE);
     w32(byteRate);
-    w16(TARGET_CHANNELS * sizeof(float));
-    w16(32);                         // bits per sample
-    f.write("data", 4);  w32(dataBytes);
+    w16(sizeof(float));  // block align
+    w16(32);             // bits per sample
+    f.write("data", 4); w32(dataBytes);
 }
 
-void patchWavHeader(ofstream& f, uint32_t totalSamples)
+void patchWavHeader(ofstream& f, uint32_t totalFrames)
 {
-    uint32_t dataBytes = totalSamples * sizeof(float);
+    uint32_t dataBytes = totalFrames * sizeof(float);
     f.seekp(4);  uint32_t chunkSize = 36 + dataBytes; f.write((char*)&chunkSize, 4);
     f.seekp(40); f.write((char*)&dataBytes, 4);
     f.seekp(0, ios::end);
 }
 
 // ─── Processing thread ────────────────────────────────────────────────────────
-// Wakes every CHUNK_INTERVAL_SEC seconds, drains both buffers,
-// applies drift-corrected resampling, mixes, and appends to file.
 void processingThread(const string& outPath)
 {
     ofstream out(outPath, ios::binary);
     if (!out) { cerr << "Cannot open output file\n"; return; }
-
-    // Reserve space for WAV header; patch it at the end.
     writeWavHeader(out, 0);
 
     DriftState drift;
-    uint64_t totalSamplesWritten = 0;
+    Resampler  micRes, spkRes;
+    micRes.init(micChannels, (uint32_t)micRate);
+    spkRes.init(spkChannels, (uint32_t)spkRate);
 
-    while (recording.load() || !micAudio.samples.empty() || !spkAudio.samples.empty())
-    {
-        auto wakeAt = steady_clock::now() + seconds(CHUNK_INTERVAL_SEC);
+    uint64_t totalFramesWritten = 0;
 
-        // ── Drain and resample ────────────────────────────────────────────────
+    auto drainAndWrite = [&]() {
         double effMic, effSpk;
         updateDrift(drift, micRate, spkRate, effMic, effSpk);
 
-        vector<float> mic48 = drainAndResample(micAudio, micChannels, effMic);
-        vector<float> spk48 = drainAndResample(spkAudio, spkChannels, effSpk);
+        vector<float> micMono = micRes.drain(micAudio, effMic);
+        vector<float> spkMono = spkRes.drain(spkAudio, effSpk);
+        if (micMono.empty() && spkMono.empty()) return;
 
-        if (mic48.empty() && spk48.empty()) {
-            if (recording.load())
-                this_thread::sleep_until(wakeAt);
-            continue;
+        // Mix: average both streams into a single mono sample.
+        // If one stream is shorter, the tail gets only the other stream at full level.
+        size_t frames = max(micMono.size(), spkMono.size());
+        vector<float> mono(frames);
+        for (size_t i = 0; i < frames; i++) {
+            float m = (i < micMono.size()) ? micMono[i] : 0.0f;
+            float s = (i < spkMono.size()) ? spkMono[i] : 0.0f;
+            // Average instead of sum — prevents clipping when both streams are loud
+            mono[i] = max(-1.0f, min(1.0f, (m + s) * 0.5f));
         }
 
-        // ── Mix ───────────────────────────────────────────────────────────────
-        size_t maxSz = max(mic48.size(), spk48.size());
-        vector<float> chunk(maxSz, 0.0f);
-        for (size_t i = 0; i < mic48.size(); i++) chunk[i] += mic48[i];
-        for (size_t i = 0; i < spk48.size(); i++) chunk[i] += spk48[i];
-        for (float& s : chunk) s = max(-1.0f, min(1.0f, s));
+        out.write((char*)mono.data(), mono.size() * sizeof(float));
+        totalFramesWritten += frames;
 
-        // ── Append to file ────────────────────────────────────────────────────
-        out.write((char*)chunk.data(), chunk.size() * sizeof(float));
-        totalSamplesWritten += chunk.size();
-
-        // Print RAM pressure info
+        size_t pending;
         {
             lock_guard<mutex> lm(micAudio.mtx);
             lock_guard<mutex> ls(spkAudio.mtx);
-            size_t pending = (micAudio.samples.size() + spkAudio.samples.size()) * sizeof(float);
-            if (pending > 50 * 1024 * 1024)  // warn if > 50 MB pending
-                cout << "[WARNING] Pending buffer: " << pending / (1024*1024) << " MB — disk too slow?\n";
+            pending = (micAudio.samples.size() + spkAudio.samples.size()) * sizeof(float);
         }
+        if (pending > 50 * 1024 * 1024)
+            cout << "[WARNING] " << pending/(1024*1024) << " MB pending — disk too slow?\n";
+    };
 
-        if (recording.load())
-            this_thread::sleep_until(wakeAt);
+    while (true) {
+        {
+            unique_lock<mutex> lk(wakeMtx);
+            wakeCV.wait_for(lk, milliseconds(CHUNK_INTERVAL_MS),
+                            []{ return !recording.load(); });
+        }
+        drainAndWrite();
+        if (!recording.load()) {
+            drainAndWrite();  // final boundary drain
+            break;
+        }
     }
 
-    // Patch the WAV header with the actual data size
-    patchWavHeader(out, (uint32_t)totalSamplesWritten);
+    patchWavHeader(out, (uint32_t)totalFramesWritten);
     out.close();
 
-    cout << "\nOutput written: " << outPath << "\n";
-    cout << "Total samples: " << totalSamplesWritten
-         << " (" << totalSamplesWritten / TARGET_CHANNELS / TARGET_RATE << " s)\n";
+    double secs = (double)totalFramesWritten / TARGET_RATE;
+    cout << "\nOutput: " << outPath << "\n";
+    cout << "Duration: " << fixed << secs << " s\n";
+    cout << "Format: Mono float32 WAV @ 48kHz — ready to use directly\n";
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -310,29 +295,32 @@ int main()
     }
 
     int micDev, spkDev;
-    cout << "\nEnter MIC ID: ";             cin >> micDev;
-    cout << "Enter SPEAKER DEVICE ID: ";   cin >> spkDev;
+    cout << "\nEnter MIC ID: ";           cin >> micDev;
+    cout << "Enter SPEAKER DEVICE ID: "; cin >> spkDev;
     cin.ignore();
 
     const PaDeviceInfo* micInfo = Pa_GetDeviceInfo(micDev);
     const PaDeviceInfo* spkInfo = Pa_GetDeviceInfo(spkDev);
 
     micChannels = micInfo->maxInputChannels;
-    spkChannels = spkInfo->maxOutputChannels ==0 ? spkInfo->maxInputChannels :spkInfo->maxOutputChannels;
-    micRate     = micInfo->defaultSampleRate;
-    spkRate     = spkInfo->defaultSampleRate;
-
-    if (spkInfo->maxInputChannels == 0) {
-    cout << "Selected speaker device cannot provide input (no loopback).\n";
-    return 1;
-    }
+    spkChannels = spkInfo->maxOutputChannels == 0 ? spkInfo->maxInputChannels: spkInfo->maxOutputChannels;
+    micRate = micInfo->defaultSampleRate;
+    spkRate = spkInfo->defaultSampleRate;
 
     cout << "\n--- Quality Check ---\n";
     cout << "Mic:     " << micChannels << "ch @ " << micRate << "Hz\n";
     cout << "Speaker: " << spkChannels << "ch @ " << spkRate << "Hz\n";
-    if (micRate < 44100) cout << "WARNING: Mic rate is low (" << micRate << "Hz)\n";
-    if (spkRate < 44100) cout << "WARNING: Speaker rate is low (" << spkRate << "Hz)\n";
+    if (micRate < 44100) cout << "WARNING: Mic rate low (" << micRate << "Hz)\n";
+    if (spkRate < 44100) cout << "WARNING: Speaker rate low (" << spkRate << "Hz)\n";
+    cout << "Output:  Mono WAV (mic + speaker averaged)\n";
     cout << "---------------------\n\n";
+
+    {
+        lock_guard<mutex> lm(micAudio.mtx);
+        lock_guard<mutex> ls(spkAudio.mtx);
+        micAudio.samples.reserve((size_t)(micRate * micChannels * (CHUNK_INTERVAL_MS/1000.0) * 2));
+        spkAudio.samples.reserve((size_t)(spkRate * spkChannels * (CHUNK_INTERVAL_MS/1000.0) * 2));
+    }
 
     PaStreamParameters micParams{}, spkParams{};
     micParams.device           = micDev;
@@ -344,15 +332,6 @@ int main()
     spkParams.channelCount     = spkChannels;
     spkParams.sampleFormat     = paFloat32;
     spkParams.suggestedLatency = spkInfo->defaultLowInputLatency;
-    
-
-    PaWasapiStreamInfo wasapiInfo{};
-    wasapiInfo.size = sizeof(PaWasapiStreamInfo);
-    wasapiInfo.hostApiType = paWASAPI;
-    wasapiInfo.version = 1;
-    wasapiInfo.flags = paWASAPIUseOutputDeviceForInput;
-
-    spkParams.hostApiSpecificStreamInfo = &wasapiInfo;
 
     PaStream *micStream, *spkStream;
     PaError err;
@@ -364,8 +343,6 @@ int main()
     if (err != paNoError) { cout << "ERROR spk: " << Pa_GetErrorText(err) << "\n"; return 1; }
 
     recordStart = steady_clock::now();
-
-    // Start background processing thread BEFORE the streams
     thread proc(processingThread, "audio.wav");
 
     Pa_StartStream(micStream);
@@ -380,8 +357,12 @@ int main()
     Pa_CloseStream(spkStream);
     Pa_Terminate();
 
-    recording.store(false);
-    proc.join();           // wait for final flush
+    {
+        lock_guard<mutex> lk(wakeMtx);
+        recording.store(false);
+    }
+    wakeCV.notify_one();
 
+    proc.join();
     return 0;
 }
