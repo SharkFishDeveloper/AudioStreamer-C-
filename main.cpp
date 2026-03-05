@@ -167,7 +167,8 @@ struct Resampler {
 
     vector<float> drain(SharedAudio& src, double inRate) {
         uint32_t rateInt = (uint32_t)round(inRate);
-        if (!initialised || rateInt != currentRate) init(inChannels, rateInt);
+        // if (!initialised || rateInt != currentRate) init(inChannels, rateInt);
+        if (!initialised) init(inChannels, rateInt);
 
         vector<float> input;
         { lock_guard<mutex> lk(src.mtx); input.swap(src.samples); }
