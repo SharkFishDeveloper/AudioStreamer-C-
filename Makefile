@@ -1,13 +1,10 @@
 CC = gcc
 CXX = g++
 
-# Paths to libsamplerate
-SAMPLERATE_INC = -I./libsamplerate/include
-SAMPLERATE_LIB = -L./libsamplerate/build/src -lsamplerate
-
 # Compiler settings
 CFLAGS = -I./portaudio/include -I./portaudio/src/common -I./portaudio/src/os/win -DPA_USE_WASAPI=1 $(SAMPLERATE_INC)
-LDFLAGS = -lwinmm -lole32 -luuid -lsetupapi $(SAMPLERATE_LIB)
+# LDFLAGS = -lwinmm -lole32 -luuid -lsetupapi $(SAMPLERATE_LIB)
+LDFLAGS = -static -static-libgcc -static-libstdc++ -lwinmm -lole32 -luuid -lsetupapi -lavrt
 
 # Folders
 OBJ_DIR = build
