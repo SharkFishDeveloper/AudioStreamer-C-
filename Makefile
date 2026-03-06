@@ -32,14 +32,14 @@ PA_OBJECTS = $(addprefix $(OBJ_DIR)/, $(notdir $(PA_SOURCES:.c=.o)))
 MAIN_OBJECT = $(OBJ_DIR)/main.o
 
 # Default target
-all: $(OBJ_DIR) main.exe
+all: $(OBJ_DIR) AudioStreamer
 
 # Create build directory
 $(OBJ_DIR):
 	@if not exist $(OBJ_DIR) mkdir $(OBJ_DIR)
 
 # Link everything
-main.exe: $(PA_OBJECTS) $(MAIN_OBJECT)
+AudioStreamer: $(PA_OBJECTS) $(MAIN_OBJECT)
 	$(CXX) $^ $(LDFLAGS) -o $@
 
 # Compile main.cpp
@@ -60,4 +60,4 @@ $(OBJ_DIR)/%.o: portaudio/src/hostapi/wasapi/%.c
 
 clean:
 	@if exist $(OBJ_DIR) rmdir /s /q $(OBJ_DIR)
-	@if exist main.exe del main.exe
+	@if exist AudioStreamer del AudioStreamer

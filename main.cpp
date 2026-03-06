@@ -1,5 +1,9 @@
 #include <iostream>
 #include <vector>
+#include <string>
+#include <sstream>
+#include <fcntl.h>
+#include <io.h>
 #include <deque>
 #include <fstream>
 #include <algorithm>
@@ -191,10 +195,20 @@ struct Resampler {
 
     ~Resampler() { if (initialised) ma_data_converter_uninit(&conv, NULL); }
 
+    void updateRate(uint32_t newRate) {
+        if (!initialised) {
+            init(inChannels, newRate);
+        } else if (newRate != currentRate) {
+            ma_data_converter_set_rate(&conv, newRate, TARGET_RATE);
+            currentRate = newRate;
+        }
+    }
+
+
     vector<float> drain(SharedAudio& src, double inRate) {
         uint32_t rateInt = (uint32_t)round(inRate);
         // Reinit when drift correction changes integer rate — preserves correction accuracy
-        if (!initialised || rateInt != currentRate) init(inChannels, rateInt);
+        updateRate(rateInt);
 
         ring_buffer_size_t available = PaUtil_GetRingBufferReadAvailable(&src.ringBuffer);
         if (available <= 0) return {};
