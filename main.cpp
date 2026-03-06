@@ -184,7 +184,8 @@ struct Resampler{
     ma_data_converter conv;
     bool initialised=false;
     int inChannels=0;
-    uint32_t currentRate=0;
+    uint32_t currentRate = 0;
+    double lastAppliedRatio = 0.0;// Added this to store state
 
     void init(int inCh,uint32_t inRate){
 
@@ -202,10 +203,17 @@ struct Resampler{
 
         inChannels=inCh;
         currentRate=inRate;
+        lastAppliedRatio = (double)inRate / (double)TARGET_RATE;
         initialised=true;
     }
 
     vector<float> drain(SharedAudio& src,double inRate){
+        if (!initialised) return {};
+        double newRatio = inRate / (double)TARGET_RATE;
+        if (std::abs(newRatio - lastAppliedRatio) > 0.0001) {
+            ma_data_converter_set_rate_ratio(&conv, newRatio);
+            lastAppliedRatio = newRatio;
+        }
 
         ring_buffer_size_t available=
         PaUtil_GetRingBufferReadAvailable(&src.ringBuffer);
@@ -220,6 +228,7 @@ struct Resampler{
 
         ma_data_converter_get_expected_output_frame_count(
         &conv,available,&framesOut);
+        
 
         vector<float> out(framesOut+64);
 
