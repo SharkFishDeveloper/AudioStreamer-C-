@@ -74,6 +74,10 @@ atomic<uint64_t> spkTotalFrames{0};
 atomic<bool> recording{true};
 atomic<bool> processingDone{false};
 
+// Which sources are active
+atomic<bool> hasMic{false};
+atomic<bool> hasSpk{false};
+
 mutex wakeMtx;
 condition_variable wakeCV;
 
@@ -235,19 +239,26 @@ void processingThread(){
 
     DriftState drift;
 
+    // Only construct resamplers for active sources
     Resampler micRes,spkRes;
 
-    micRes.init(micChannels,(uint32_t)micRate);
-    spkRes.init(spkChannels,(uint32_t)spkRate);
+    if(hasMic.load()) micRes.init(micChannels,(uint32_t)micRate);
+    if(hasSpk.load()) spkRes.init(spkChannels,(uint32_t)spkRate);
+
+    // Nominal rates for drift tracking — use 16000 as fallback for inactive side
+    double nomMic = hasMic.load() ? micRate : TARGET_RATE;
+    double nomSpk = hasSpk.load() ? spkRate : TARGET_RATE;
 
     auto drainAndQueue=[&](){
 
         double effMic,effSpk;
 
-        updateDrift(drift,micRate,spkRate,effMic,effSpk);
+        updateDrift(drift,nomMic,nomSpk,effMic,effSpk);
 
-        vector<float> micMono=micRes.drain(micAudio,effMic);
-        vector<float> spkMono=spkRes.drain(spkAudio,effSpk);
+        vector<float> micMono,spkMono;
+
+        if(hasMic.load()) micMono=micRes.drain(micAudio,effMic);
+        if(hasSpk.load()) spkMono=spkRes.drain(spkAudio,effSpk);
 
         if(micMono.empty()&&spkMono.empty()) return;
 
@@ -394,63 +405,80 @@ int main(int argc,char* argv[]){
         return 0;
     }
 
-    if(micDev<0||spkDev<0){
-        nodeError("missing device ids");
+    if(micDev<0 && spkDev<0){
+        nodeError("No devices specified. Use --mic, --speaker, or both.");
+        Pa_Terminate();
         return 1;
     }
 
     int numDevices=Pa_GetDeviceCount();
 
-    if(micDev>=numDevices||spkDev>=numDevices){
-        nodeError("invalid device id");
+    if(micDev>=0 && micDev>=numDevices){
+        nodeError("invalid mic device id");
+        Pa_Terminate();
         return 1;
     }
 
-    const PaDeviceInfo* micInfo=Pa_GetDeviceInfo(micDev);
-    const PaDeviceInfo* spkInfo=Pa_GetDeviceInfo(spkDev);
+    if(spkDev>=0 && spkDev>=numDevices){
+        nodeError("invalid speaker device id");
+        Pa_Terminate();
+        return 1;
+    }
 
-    micChannels=micInfo->maxInputChannels;
+    const PaDeviceInfo* micInfo = (micDev>=0) ? Pa_GetDeviceInfo(micDev) : nullptr;
+    const PaDeviceInfo* spkInfo = (spkDev>=0) ? Pa_GetDeviceInfo(spkDev) : nullptr;
 
-    spkChannels=spkInfo->maxOutputChannels==0
-        ? spkInfo->maxInputChannels
-        : spkInfo->maxOutputChannels;
+    if(micInfo){
+        micChannels = micInfo->maxInputChannels;
+        micRate     = micInfo->defaultSampleRate;
+        micAudio.init(micChannels, micRate);
+        hasMic.store(true);
+    }
 
-    micRate=micInfo->defaultSampleRate;
-    spkRate=spkInfo->defaultSampleRate;
+    if(spkInfo){
+        spkChannels = spkInfo->maxOutputChannels==0
+            ? spkInfo->maxInputChannels
+            : spkInfo->maxOutputChannels;
+        spkRate = spkInfo->defaultSampleRate;
+        spkAudio.init(spkChannels, spkRate);
+        hasSpk.store(true);
+    }
 
-    micAudio.init(micChannels,micRate);
-    spkAudio.init(spkChannels,spkRate);
-
-    PaStreamParameters micParams{},spkParams{};
-
-    micParams.device=micDev;
-    micParams.channelCount=micChannels;
-    micParams.sampleFormat=paFloat32;
-    micParams.suggestedLatency=micInfo->defaultLowInputLatency;
-
-    spkParams.device=spkDev;
-    spkParams.channelCount=spkChannels;
-    spkParams.sampleFormat=paFloat32;
-    spkParams.suggestedLatency=spkInfo->defaultLowInputLatency;
-
-    PaStream *micStream,*spkStream;
-
+    PaStream *micStream=nullptr, *spkStream=nullptr;
     PaError err;
 
-    err=Pa_OpenStream(&micStream,&micParams,NULL,micRate,
-    FRAMES_PER_BUFFER,paClipOff,micCallback,NULL);
+    if(micInfo){
+        PaStreamParameters micParams{};
+        micParams.device           = micDev;
+        micParams.channelCount     = micChannels;
+        micParams.sampleFormat     = paFloat32;
+        micParams.suggestedLatency = micInfo->defaultLowInputLatency;
 
-    if(err!=paNoError){
-        nodeError("cannot open mic stream");
-        return 1;
+        err=Pa_OpenStream(&micStream,&micParams,NULL,micRate,
+        FRAMES_PER_BUFFER,paClipOff,micCallback,NULL);
+
+        if(err!=paNoError){
+            nodeError("cannot open mic stream");
+            Pa_Terminate();
+            return 1;
+        }
     }
 
-    err=Pa_OpenStream(&spkStream,&spkParams,NULL,spkRate,
-    FRAMES_PER_BUFFER,paClipOff,spkCallback,NULL);
+    if(spkInfo){
+        PaStreamParameters spkParams{};
+        spkParams.device           = spkDev;
+        spkParams.channelCount     = spkChannels;
+        spkParams.sampleFormat     = paFloat32;
+        spkParams.suggestedLatency = spkInfo->defaultLowInputLatency;
 
-    if(err!=paNoError){
-        nodeError("cannot open speaker stream");
-        return 1;
+        err=Pa_OpenStream(&spkStream,&spkParams,NULL,spkRate,
+        FRAMES_PER_BUFFER,paClipOff,spkCallback,NULL);
+
+        if(err!=paNoError){
+            nodeError("cannot open speaker stream");
+            Pa_Terminate();
+            return 1;
+        }
     }
 
     recordStart=steady_clock::now();
@@ -458,8 +486,8 @@ int main(int argc,char* argv[]){
     thread proc(processingThread);
     thread send(senderThread);
 
-    Pa_StartStream(micStream);
-    Pa_StartStream(spkStream);
+    if(micStream)  Pa_StartStream(micStream);
+    if(spkStream)  Pa_StartStream(spkStream);
 
     while(true)
         this_thread::sleep_for(seconds(1));
